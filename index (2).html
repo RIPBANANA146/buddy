@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Desk Buddy</title>
+<style>
+:root{--bg:#f6f6f3;--fg:#1c1c1a;--card:#fff;--muted:#6b6b66;--acc:#2f6fed;--bd:#dcdcd6;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#161615;--fg:#eeeeea;--card:#222220;--muted:#9a9a94;--acc:#6b9bff;--bd:#3a3a36}}
+*{box-sizing:border-box}html,body{margin:0}
+body{background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;padding:16px;max-width:520px;margin:0 auto}
+h1{font-size:20px;margin:0 0 12px}
+button,input,select{font:inherit;border:1px solid var(--bd);background:var(--card);color:var(--fg);border-radius:12px;padding:12px 14px}
+button{width:100%}input,select{width:100%;margin-bottom:8px}
+#talk{background:var(--acc);color:#fff;border:0;font-size:20px;padding:26px;margin:12px 0}
+button:disabled{opacity:.45}
+.row{display:flex;gap:8px}.row input{margin:0;min-width:0}.row button{width:auto}
+#log{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:12px;min-height:120px;margin-top:12px;white-space:pre-wrap;overflow-wrap:anywhere}
+.pill{font-size:14px;color:var(--muted);margin:8px 0}
+label{font-size:14px;color:var(--muted);display:flex;gap:8px;align-items:center;margin-top:10px}
+details{margin-bottom:10px}summary{color:var(--muted);margin-bottom:8px}
+</style></head><body>
+<h1>Desk Buddy</h1>
+<details id="set"><summary>Settings (Google AI Studio key)</summary>
+<input id="key" type="password" placeholder="Paste your Google AI Studio API key" autocomplete="off">
+<input id="model" placeholder="Models, tried in order" value="gemini-3.5-flash-lite, gemini-3.1-flash-lite, gemini-3.5-flash">
+<button id="load" style="margin-bottom:8px">Load the list of available models</button>
+<select id="pick"><option value="">Pick a model to add to the list…</option></select>
+<button id="save">Save</button></details>
+<button id="conn">1. Connect to the buddy face</button>
+<div class="pill" id="st">Not connected</div>
+<button id="talk">2. Tap to talk</button>
+<label><input type="checkbox" id="keep" style="width:auto;margin:0"> Keep listening after each reply</label>
+<div class="row" style="margin-top:12px"><input id="typed" placeholder="Or type a message…"><button id="go">Send</button></div>
+<div id="log">Conversation will appear here.</div>
+<script>
+const SVC="6e400001-b5a3-f393-e0a9-e50e24dcca9e",RX="6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+const SYS="You are a friendly desk buddy. Reply in 1-2 short spoken sentences, plain text, no markdown or emoji.";
+const $=id=>document.getElementById(id);
+const store={get:k=>{try{return localStorage.getItem(k)||""}catch(e){return ""}},set:(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}}};
+let ch=null,q=Promise.resolve(),busy=false,history=[];
+const enc=new TextEncoder();
+const status=t=>$("st").textContent=t, log=t=>$("log").textContent=t;
+$("key").value=store.get("gkey");if(store.get("gmodels"))$("model").value=store.get("gmodels");
+if(!$("key").value)$("set").open=true;
+$("save").onclick=()=>{store.set("gkey",$("key").value.trim());store.set("gmodels",$("model").value.trim());$("set").open=false;log("Saved.");};
+
+// ---- Model list ----
+$("load").onclick=async()=>{
+  const key=$("key").value.trim()||store.get("gkey");
+  if(!key){log("Paste your API key first.");return;}
+  try{
+    const r=await fetch("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",{headers:{"x-goog-api-key":key}});
+    const j=await r.json();
+    if(!r.ok)throw new Error((j.error&&j.error.message)||("HTTP "+r.status));
+    const names=(j.models||[])
+      .filter(m=>(m.supportedGenerationMethods||[]).includes("generateContent"))
+      .map(m=>m.name.replace("models/",""))
+      .filter(n=>/^gemini/.test(n)&&!/tts|image|embed|live|audio|robot|computer|veo/.test(n)).sort();
+    $("pick").innerHTML='<option value="">Pick a model to add to the list…</option>'+names.map(n=>'<option>'+n+'</option>').join("");
+    log("Found "+names.length+" models. Choose one from the dropdown to add it.");
+  }catch(e){log("Could not load models: "+e.message);}
+};
+$("pick").onchange=()=>{
+  const v=$("pick").value;if(!v)return;
+  const cur=$("model").value.split(",").map(x=>x.trim()).filter(Boolean);
+  if(!cur.includes(v))cur.push(v);
+  $("model").value=cur.join(", ");$("pick").value="";
+};
+
+// ---- Bluetooth ----
+function send(p,m){
+  if(!ch)return;
+  const bytes=enc.encode(p+":"+String(m).replace(/[^\x20-\x7E]/g,"?").slice(0,160)+"\n");
+  q=q.then(async()=>{for(let i=0;i<bytes.length;i+=20)await ch.writeValue(bytes.slice(i,i+20));}).catch(()=>{});
+}
+$("conn").onclick=async()=>{
+  if(!navigator.bluetooth){status("No Bluetooth here. Use Chrome on Android over https.");return;}
+  try{
+    const dev=await navigator.bluetooth.requestDevice({filters:[{namePrefix:"Buddy"}],optionalServices:[SVC]});
+    dev.addEventListener("gattserverdisconnected",()=>{ch=null;status("Disconnected");});
+    const s=await (await dev.gatt.connect()).getPrimaryService(SVC);
+    ch=await s.getCharacteristic(RX);
+    status("Connected to "+dev.name);send("S","idle");send("T","Hi Osama!");
+  }catch(e){status("Could not connect: "+e.message);}
+};
+
+// ---- Speech in / out ----
+const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+function listen(){
+  return new Promise(res=>{
+    if(!SR){log("Speech input isn’t available in this browser. Type instead.");res("");return;}
+    const r=new SR();r.lang="en-US";r.interimResults=true;let got="";
+    r.onresult=e=>{got=Array.from(e.results).map(x=>x[0].transcript).join(" ");log("Listening… "+got);};
+    r.onend=()=>res(got.trim());r.onerror=()=>{};r.start();
+  });
+}
+function speak(text){
+  return new Promise(res=>{
+    const u=new SpeechSynthesisUtterance(text);
+    u.onstart=()=>send("S","speaking");u.onend=u.onerror=()=>res();
+    speechSynthesis.cancel();speechSynthesis.speak(u);
+  });
+}
+
+// ---- AI (Google Gemini) ----
+async function ask(){
+  const key=store.get("gkey");
+  const models=($("model").value||"").split(",").map(x=>x.trim()).filter(Boolean);
+  if(!key)throw new Error("Add your API key in Settings first.");
+  const body=JSON.stringify({systemInstruction:{parts:[{text:SYS}]},
+    contents:history.slice(-9).map(m=>({role:m.role,parts:[{text:m.text}]}))});
+  let last="";
+  for(const model of models){          // each model has its own free quota, so try the next one when one runs out
+    const r=await fetch("https://generativelanguage.googleapis.com/v1beta/models/"+model+":generateContent",{
+      method:"POST",headers:{"Content-Type":"application/json","x-goog-api-key":key},body});
+    const j=await r.json().catch(()=>({}));
+    if(r.ok)return ((j.candidates&&j.candidates[0]&&j.candidates[0].content.parts)||[]).map(p=>p.text||"").join("").trim();
+    last=(j.error&&j.error.message)||("HTTP "+r.status);
+    if(![429,404,503].includes(r.status))throw new Error(last);
+  }
+  throw new Error("Every model is out of free requests for now. "+last);
+}
+
+// ---- Conversation ----
+async function cycle(user){
+  busy=true;$("talk").disabled=true;const mic=(user==null);
+  if(mic){send("S","listening");log("Listening…");user=await listen();}
+  if(user.length>=2){
+    send("S","thinking");send("T",user);log("You: "+user+"\n\nThinking…");
+    history.push({role:"user",text:user});
+    try{
+      const reply=await ask();
+      history.push({role:"model",text:reply});
+      log("You: "+user+"\n\nBuddy: "+reply);send("T",reply);
+      await speak(reply);
+    }catch(e){log("AI error: "+e.message);send("T","AI error");history.pop();}
+  }
+  send("S","idle");busy=false;$("talk").disabled=false;
+  if(mic&&$("keep").checked)setTimeout(()=>{if(!busy&&$("keep").checked)cycle(null)},600);
+}
+$("talk").onclick=()=>{if(!busy)cycle(null);};
+$("go").onclick=()=>{const v=$("typed").value.trim();if(!v||busy)return;$("typed").value="";cycle(v);};
+</script></body></html>
